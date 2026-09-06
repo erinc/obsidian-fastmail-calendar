@@ -1,4 +1,4 @@
-import { App, FileSystemAdapter, ItemView, Platform, Plugin, PluginSettingTab, WorkspaceLeaf, Notice, Setting } from "obsidian";
+import { App, FileSystemAdapter, ItemView, Platform, Plugin, PluginSettingTab, WorkspaceLeaf, Notice, Setting, setIcon } from "obsidian";
 import { compactTime, dayStamp, formatRange, momentFormatToRegex, parseDateFromBasename, startOfDay, toLocalISO } from "./dates";
 
 // Node APIs are only available on desktop. Import lazily so mobile never parses them.
@@ -551,36 +551,57 @@ class AppleCalendarView extends ItemView {
       return;
     }
 
+    // One combined list: events and reminders interleaved chronologically.
+    // Timeless rows (all-day events, undated reminders) sort first.
+    type Row =
+      | { kind: "event"; at: number; ev: CalEvent }
+      | { kind: "reminder"; at: number; rem: CalReminder };
+    const rows: Row[] = [];
     if (this.events.length > 0) {
       const sorted = [...this.events].sort((a, b) => +new Date(a.start) - +new Date(b.start));
-      const ul = el.createEl("ul", { cls: "obsidian-apple-cal-list" });
       for (const ev of sorted) {
-        const li = ul.createEl("li", { cls: "obsidian-apple-cal-item" });
+        const at = +new Date(ev.start);
+        rows.push({ kind: "event", at: Number.isFinite(at) ? at : Number.POSITIVE_INFINITY, ev });
+      }
+    }
+    if (showReminders) {
+      for (const rem of this.reminders) {
+        let at = Number.NEGATIVE_INFINITY;
+        if (rem.due) {
+          const t = +new Date(rem.due);
+          if (Number.isFinite(t)) at = t;
+        }
+        rows.push({ kind: "reminder", at, rem });
+      }
+    }
+    rows.sort((a, b) => a.at - b.at || (a.kind === b.kind ? 0 : a.kind === "event" ? -1 : 1));
+
+    const ul = el.createEl("ul", { cls: "obsidian-apple-cal-list" });
+    for (const row of rows) {
+      const li = ul.createEl("li", { cls: "obsidian-apple-cal-item" });
+      const line = li.createEl("div", { cls: "obsidian-apple-cal-row" });
+      if (row.kind === "event") {
+        const ev = row.ev;
+        const icon = line.createEl("span", { cls: "obsidian-apple-cal-icon" });
+        setIcon(icon, "calendar");
         const title = ev.title || "(no title)";
-        const titleEl = li.createEl("div", { text: title, cls: "obsidian-apple-cal-title obsidian-apple-cal-open" });
+        const titleEl = line.createEl("div", { text: title, cls: "obsidian-apple-cal-title obsidian-apple-cal-open" });
         titleEl.setAttribute("title", `${title} — open in Calendar`);
         titleEl.onclick = () => void this.plugin.openInCalendar(ev);
         const range = formatRange(ev.start, ev.end, ev.allDay);
         const meta = range ? [range] : [];
         if (ev.calendar) meta.push(ev.calendar);
         if (meta.length > 0) {
-          const metaEl = li.createEl("div", { text: meta.join(" · "), cls: "obsidian-apple-cal-meta" });
+          const metaEl = li.createEl("div", { text: meta.join(" · "), cls: "obsidian-apple-cal-meta obsidian-apple-cal-meta-indent" });
           metaEl.setAttribute("title", meta.join(" · "));
         }
-      }
-    }
-
-    // Reminders due on the shown day. Titles are plain text (no deep link
-    // into Reminders.app — it has no stable URL scheme like Calendar).
-    if (showReminders && (this.reminders.length > 0 || this.remindersError)) {
-      el.createEl("div", { text: "Reminders", cls: "obsidian-apple-cal-heading" });
-      if (this.remindersError) {
-        el.createEl("div", { text: this.remindersError, cls: "obsidian-apple-cal-muted" });
-      }
-      const ul = el.createEl("ul", { cls: "obsidian-apple-cal-list" });
-      for (const rem of this.reminders) {
-        const li = ul.createEl("li", { cls: "obsidian-apple-cal-item" });
-        li.createEl("div", { text: rem.title || "(no title)", cls: "obsidian-apple-cal-title" });
+      } else {
+        // Reminder titles stay plain text (no deep link into
+        // Reminders.app — it has no stable URL scheme like Calendar).
+        const rem = row.rem;
+        const icon = line.createEl("span", { cls: "obsidian-apple-cal-icon" });
+        setIcon(icon, "check-square");
+        line.createEl("div", { text: rem.title || "(no title)", cls: "obsidian-apple-cal-title" });
         const meta: string[] = [];
         if (rem.due && !rem.allDay) {
           try {
@@ -591,10 +612,14 @@ class AppleCalendarView extends ItemView {
         }
         if (rem.list) meta.push(rem.list);
         if (meta.length > 0) {
-          const metaEl = li.createEl("div", { text: meta.join(" · "), cls: "obsidian-apple-cal-meta" });
+          const metaEl = li.createEl("div", { text: meta.join(" · "), cls: "obsidian-apple-cal-meta obsidian-apple-cal-meta-indent" });
           metaEl.setAttribute("title", meta.join(" · "));
         }
       }
+    }
+
+    if (showReminders && this.remindersError) {
+      el.createEl("div", { text: this.remindersError, cls: "obsidian-apple-cal-muted" });
     }
   }
 }
