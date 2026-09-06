@@ -12,6 +12,9 @@ How it works, in plain terms:
 - The plugin runs that helper, then renders one compact row per event:
   title plus a one-line summary (`6–9 PM · Personal`, or `Sep 4 – Sep 7`
   for multi-day events). No location, no clutter.
+- Optionally, a "Reminders" section below the events lists Apple Reminders
+  due on the shown day (timed ones show `6 PM · Groceries`, dated ones
+  just the list name). Read-only and plain text.
 - Click a title to jump to that event in Calendar.app.
 - The plugin only runs on macOS desktop. There is nothing to sync, no
   account to connect, and no network involved — everything stays on your Mac.
@@ -46,6 +49,8 @@ The first fetch triggers a macOS prompt asking for Calendars access. Allow
 it under System Settings → Privacy & Security → Calendars, then press Retry
 in the sidebar (or run the "Refresh Apple Calendar" command). If you deny
 it by accident, same place to fix it — the sidebar tells you exactly this.
+With "Show reminders" on, the first fetch also prompts for Reminders
+access (separate permission, same Privacy & Security page).
 
 No other permission is needed. Opening events uses Calendar's own link
 format, not automation, so there is no Automation prompt.
@@ -71,6 +76,9 @@ format, not automation, so there is no Automation prompt.
 
 ## Settings
 
+- **Show reminders** (on) — lists incomplete Apple Reminders due on the
+  shown day under a "Reminders" heading. Turn it off to skip the extra
+  Reminders permission prompt.
 - **Auto-refresh (minutes)** — background re-fetch of the shown day.
   `0` disables it.
 - **Hide tab header when alone** — hides this pane's tab strip when it is
@@ -89,6 +97,8 @@ format, not automation, so there is no Automation prompt.
   then Retry.
 - *"Calendar access denied"* — grant access under System Settings →
   Privacy & Security → Calendars, then Retry.
+- *"Reminders access denied"* (shown under the Reminders heading) — same
+  page, but under Reminders instead, then Retry.
 - *Sidebar shows "Daily Notes is required"* — enable the Daily Notes core
   plugin with a numeric date format (e.g. `YYYY-MM-DD`). If it names your
   format instead (`Daily Notes format "…" can't be matched`), switch Daily
@@ -107,5 +117,6 @@ The helper is also usable on its own for scripting:
 ```bash
 ./bin/apple-calendar-helper --days 7 --json
 ./bin/apple-calendar-helper --from 2026-09-04T00:00:00 --to 2026-09-05T00:00:00 --json
+./bin/apple-calendar-helper --from 2026-09-04T00:00:00 --to 2026-09-05T00:00:00 --json --reminders
 ./bin/apple-calendar-helper calendars
 ```

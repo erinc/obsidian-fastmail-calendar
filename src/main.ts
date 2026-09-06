@@ -1,5 +1,5 @@
 import { App, FileSystemAdapter, ItemView, Platform, Plugin, PluginSettingTab, WorkspaceLeaf, Notice, Setting } from "obsidian";
-import { dayStamp, formatRange, momentFormatToRegex, parseDateFromBasename, startOfDay, toLocalISO } from "./dates";
+import { compactTime, dayStamp, formatRange, momentFormatToRegex, parseDateFromBasename, startOfDay, toLocalISO } from "./dates";
 
 // Node APIs are only available on desktop. Import lazily so mobile never parses them.
 declare const require: (id: string) => any;
@@ -23,20 +23,39 @@ interface HelperCalendar {
   title: string;
 }
 
+interface CalReminder {
+  id: string;
+  title: string;
+  due?: string | null;
+  allDay: boolean;
+  list: string;
+  listId: string;
+}
+
+interface DayData {
+  events: CalEvent[];
+  reminders: CalReminder[];
+  remindersError?: string;
+}
+
 interface HelperResult {
   events: CalEvent[];
+  reminders?: CalReminder[];
+  remindersError?: string;
 }
 
 interface AppleCalSettings {
   refreshMinutes: number;
   hideSoloTabHeader: boolean;
   hiddenCalendars: string[];
+  showReminders: boolean;
 }
 
 const DEFAULT_SETTINGS: AppleCalSettings = {
   refreshMinutes: 15,
   hideSoloTabHeader: true,
   hiddenCalendars: [],
+  showReminders: true,
 };
 
 export default class AppleCalendarPlugin extends Plugin {
@@ -138,7 +157,7 @@ export default class AppleCalendarPlugin extends Plugin {
 
   /** Day shown in the sidebar (local start-of-day). */
   currentDay: Date = startOfDay(new Date());
-  private eventCache = new Map<string, { at: number; events: CalEvent[] }>();
+  private eventCache = new Map<string, { at: number; data: DayData }>();
 
   /**
    * Recompute the shown day from the active note. Undated notes keep the
@@ -273,20 +292,24 @@ export default class AppleCalendarPlugin extends Plugin {
     if (this.updateDayFromActiveFile(pattern)) this.refreshAllViews(true);
   }
 
-  /** Events for the current day (5-minute in-memory cache per day). */
-  fetchEvents(force = false): Promise<CalEvent[]> {
-    const key = dayStamp(this.currentDay);
+  /** Events + reminders for the current day (5-minute in-memory cache per day). */
+  fetchDay(force = false): Promise<DayData> {
+    const key = `${dayStamp(this.currentDay)}|rem:${this.settings.showReminders ? 1 : 0}`;
     const cached = this.eventCache.get(key);
     if (!force && cached && Date.now() - cached.at < 5 * 60 * 1000) {
-      return Promise.resolve(this.applyCalendarFilter(cached.events));
+      return Promise.resolve({
+        events: this.applyCalendarFilter(cached.data.events),
+        reminders: cached.data.reminders,
+        remindersError: cached.data.remindersError,
+      });
     }
-    return this.runHelperForDay(this.currentDay).then((events) => {
-      this.eventCache.set(key, { at: Date.now(), events });
+    return this.runHelperForDay(this.currentDay).then((data) => {
+      this.eventCache.set(key, { at: Date.now(), data });
       if (this.eventCache.size > 14) {
         const oldest = [...this.eventCache.keys()].sort()[0];
         this.eventCache.delete(oldest);
       }
-      return this.applyCalendarFilter(events);
+      return { ...data, events: this.applyCalendarFilter(data.events) };
     });
   }
 
@@ -351,19 +374,21 @@ export default class AppleCalendarPlugin extends Plugin {
   }
 
   /** Run the Swift helper for one local day and parse its JSON. Throws with a human message. */
-  private runHelperForDay(day: Date): Promise<CalEvent[]> {
+  private runHelperForDay(day: Date): Promise<DayData> {
     const from = new Date(day);
     const to = new Date(day.getTime() + 24 * 60 * 60 * 1000);
-    return this.spawnHelper(["--from", toLocalISO(from), "--to", toLocalISO(to), "--json"]).then(
-      (stdout) => {
-        try {
-          const parsed = JSON.parse(stdout) as HelperResult | CalEvent[];
-          return Array.isArray(parsed) ? parsed : parsed.events ?? [];
-        } catch {
-          throw new Error(`Calendar helper returned invalid JSON: ${stdout.slice(0, 200)}`);
-        }
+    const args = ["--from", toLocalISO(from), "--to", toLocalISO(to), "--json"];
+    if (this.settings.showReminders) args.push("--reminders");
+    return this.spawnHelper(args).then((stdout) => {
+      try {
+        const parsed = JSON.parse(stdout) as HelperResult | CalEvent[];
+        if (Array.isArray(parsed)) return { events: parsed, reminders: [] };
+        const reminders = this.settings.showReminders ? parsed.reminders ?? [] : [];
+        return { events: parsed.events ?? [], reminders, remindersError: parsed.remindersError };
+      } catch {
+        throw new Error(`Calendar helper returned invalid JSON: ${stdout.slice(0, 200)}`);
       }
-    );
+    });
   }
 
   /** List available calendars via the helper. Throws with a human message. */
@@ -418,6 +443,8 @@ export default class AppleCalendarPlugin extends Plugin {
 class AppleCalendarView extends ItemView {
   private plugin: AppleCalendarPlugin;
   private events: CalEvent[] = [];
+  private reminders: CalReminder[] = [];
+  private remindersError = "";
   private error = "";
   private errorHint = "";
   private loading = false;
@@ -483,7 +510,10 @@ class AppleCalendarView extends ItemView {
       return;
     }
     try {
-      this.events = await this.plugin.fetchEvents(force);
+      const day = await this.plugin.fetchDay(force);
+      this.events = day.events;
+      this.reminders = day.reminders;
+      this.remindersError = day.remindersError ?? "";
       this.error = "";
       this.errorHint = "";
     } catch (e: any) {
@@ -501,11 +531,13 @@ class AppleCalendarView extends ItemView {
     el.empty();
     el.addClass("obsidian-apple-calendar");
 
-    if (this.loading && this.events.length === 0) {
+    const showReminders = this.plugin.settings.showReminders;
+    const hasContent = this.events.length > 0 || (showReminders && this.reminders.length > 0);
+    if (this.loading && !hasContent) {
       el.createEl("p", { text: "Loading…", cls: "obsidian-apple-cal-muted" });
       return;
     }
-    if (this.error && this.events.length === 0) {
+    if (this.error && !hasContent) {
       el.createEl("p", { text: this.error, cls: "obsidian-apple-cal-error" });
       if (this.errorHint) {
         el.createEl("p", { text: this.errorHint, cls: "obsidian-apple-cal-muted" });
@@ -515,24 +547,53 @@ class AppleCalendarView extends ItemView {
       return;
     }
     // Empty days render nothing — no placeholder text.
-    if (this.events.length === 0) {
+    if (!hasContent && !this.remindersError) {
       return;
     }
 
-    const sorted = [...this.events].sort((a, b) => +new Date(a.start) - +new Date(b.start));
-    const ul = el.createEl("ul", { cls: "obsidian-apple-cal-list" });
-    for (const ev of sorted) {
-      const li = ul.createEl("li", { cls: "obsidian-apple-cal-item" });
-      const title = ev.title || "(no title)";
-      const titleEl = li.createEl("div", { text: title, cls: "obsidian-apple-cal-title obsidian-apple-cal-open" });
-      titleEl.setAttribute("title", `${title} — open in Calendar`);
-      titleEl.onclick = () => void this.plugin.openInCalendar(ev);
-      const range = formatRange(ev.start, ev.end, ev.allDay);
-      const meta = range ? [range] : [];
-      if (ev.calendar) meta.push(ev.calendar);
-      if (meta.length > 0) {
-        const metaEl = li.createEl("div", { text: meta.join(" · "), cls: "obsidian-apple-cal-meta" });
-        metaEl.setAttribute("title", meta.join(" · "));
+    if (this.events.length > 0) {
+      const sorted = [...this.events].sort((a, b) => +new Date(a.start) - +new Date(b.start));
+      const ul = el.createEl("ul", { cls: "obsidian-apple-cal-list" });
+      for (const ev of sorted) {
+        const li = ul.createEl("li", { cls: "obsidian-apple-cal-item" });
+        const title = ev.title || "(no title)";
+        const titleEl = li.createEl("div", { text: title, cls: "obsidian-apple-cal-title obsidian-apple-cal-open" });
+        titleEl.setAttribute("title", `${title} — open in Calendar`);
+        titleEl.onclick = () => void this.plugin.openInCalendar(ev);
+        const range = formatRange(ev.start, ev.end, ev.allDay);
+        const meta = range ? [range] : [];
+        if (ev.calendar) meta.push(ev.calendar);
+        if (meta.length > 0) {
+          const metaEl = li.createEl("div", { text: meta.join(" · "), cls: "obsidian-apple-cal-meta" });
+          metaEl.setAttribute("title", meta.join(" · "));
+        }
+      }
+    }
+
+    // Reminders due on the shown day. Titles are plain text (no deep link
+    // into Reminders.app — it has no stable URL scheme like Calendar).
+    if (showReminders && (this.reminders.length > 0 || this.remindersError)) {
+      el.createEl("div", { text: "Reminders", cls: "obsidian-apple-cal-heading" });
+      if (this.remindersError) {
+        el.createEl("div", { text: this.remindersError, cls: "obsidian-apple-cal-muted" });
+      }
+      const ul = el.createEl("ul", { cls: "obsidian-apple-cal-list" });
+      for (const rem of this.reminders) {
+        const li = ul.createEl("li", { cls: "obsidian-apple-cal-item" });
+        li.createEl("div", { text: rem.title || "(no title)", cls: "obsidian-apple-cal-title" });
+        const meta: string[] = [];
+        if (rem.due && !rem.allDay) {
+          try {
+            meta.push(compactTime(new Date(rem.due)));
+          } catch {
+            // Ignore unparseable due dates — list name still shows.
+          }
+        }
+        if (rem.list) meta.push(rem.list);
+        if (meta.length > 0) {
+          const metaEl = li.createEl("div", { text: meta.join(" · "), cls: "obsidian-apple-cal-meta" });
+          metaEl.setAttribute("title", meta.join(" · "));
+        }
       }
     }
   }
@@ -554,6 +615,16 @@ class AppleCalSettingTab extends PluginSettingTab {
         t.setValue(String(this.plugin.settings.refreshMinutes)).onChange(async (v) => {
           this.plugin.settings.refreshMinutes = Number(v) || 0;
           await this.plugin.saveSettings();
+        })
+      );
+    new Setting(containerEl)
+      .setName("Show reminders")
+      .setDesc("Show Apple Reminders due on the shown day. First use triggers a one-time Reminders permission prompt.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.showReminders).onChange(async (v) => {
+          this.plugin.settings.showReminders = v;
+          await this.plugin.saveSettings();
+          this.plugin.refreshAllViews(true, true);
         })
       );
     new Setting(containerEl)

@@ -10,4 +10,5 @@
 .obsidian-apple-cal-open:hover { text-decoration: underline; }
 .obsidian-apple-cal-meta { opacity: 0.7; font-size: 0.85em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .obsidian-apple-cal-muted { opacity: 0.7; font-size: 0.85em; }
+.obsidian-apple-cal-heading { font-weight: 600; font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.7; margin: 8px 0 2px; }
 .obsidian-apple-cal-error { color: var(--text-error); white-space: pre-wrap; }

@@ -1,7 +1,7 @@
 // Read-only macOS Calendar dump via EventKit. Outputs JSON to stdout.
 // Usage:
-//   apple-calendar-helper --days 7 --json
-//   apple-calendar-helper --from 2026-09-04T00:00:00 --to 2026-09-11T00:00:00 --json
+//   apple-calendar-helper --days 7 --json [--reminders]
+//   apple-calendar-helper --from 2026-09-04T00:00:00 --to 2026-09-11T00:00:00 --json [--reminders]
 //   apple-calendar-helper calendars
 import EventKit
 import Foundation
@@ -18,19 +18,31 @@ struct CalEvent: Encodable {
   let url: String?
 }
 
+struct CalReminder: Encodable {
+  let id: String
+  let title: String
+  let due: String?
+  let allDay: Bool
+  let list: String
+  let listId: String
+}
+
 struct Payload: Encodable {
   let events: [CalEvent]
+  let reminders: [CalReminder]?
+  let remindersError: String?
 }
 
 func eprint(_ s: String) {
   FileHandle.standardError.write((s + "\n").data(using: .utf8)!)
 }
 
-func parseArgs() -> (days: Int, from: Date?, to: Date?, calendars: Bool) {
+func parseArgs() -> (days: Int, from: Date?, to: Date?, calendars: Bool, reminders: Bool) {
   var days = 7
   var from: Date? = nil
   var to: Date? = nil
   var calendars = false
+  var reminders = false
   let args = CommandLine.arguments
   var i = 1
   let iso = ISO8601DateFormatter()
@@ -45,13 +57,14 @@ func parseArgs() -> (days: Int, from: Date?, to: Date?, calendars: Bool) {
   while i < args.count {
     let a = args[i]
     if a == "calendars" { calendars = true }
+    else if a == "--reminders" { reminders = true }
     else if a == "--days", i + 1 < args.count { days = max(1, min(30, Int(args[i+1]) ?? 7)); i += 1 }
     else if a == "--from", i + 1 < args.count { from = parseDate(args[i+1]); i += 1 }
     else if a == "--to", i + 1 < args.count { to = parseDate(args[i+1]); i += 1 }
     // --json accepted for forward-compat; output is always JSON
     i += 1
   }
-  return (days, from, to, calendars)
+  return (days, from, to, calendars, reminders)
 }
 
 func requestAccess(_ store: EKEventStore) -> Bool {
@@ -83,7 +96,35 @@ func requestAccess(_ store: EKEventStore) -> Bool {
   }
 }
 
-let (days, fromArg, toArg, listCalendars) = parseArgs()
+func requestReminderAccess(_ store: EKEventStore) -> Bool {
+  if #available(macOS 14.0, *) {
+    let sem = DispatchSemaphore(value: 0)
+    var granted = false
+    Task {
+      do {
+        granted = try await store.requestFullAccessToReminders()
+      } catch {
+        eprint("Reminders access request failed: \(error.localizedDescription)")
+        granted = false
+      }
+      sem.signal()
+    }
+    sem.wait()
+    return granted
+  } else {
+    let sem = DispatchSemaphore(value: 0)
+    var granted = false
+    store.requestAccess(to: .reminder) { ok, err in
+      if let err = err { eprint("Reminders access request failed: \(err.localizedDescription)") }
+      granted = ok
+      sem.signal()
+    }
+    sem.wait()
+    return granted
+  }
+}
+
+let (days, fromArg, toArg, listCalendars, wantReminders) = parseArgs()
 let store = EKEventStore()
 
 guard requestAccess(store) else {
@@ -135,7 +176,54 @@ for ev: EKEvent in ekEvents {
 }
 events.sort { $0.start < $1.start }
 
-let payload = Payload(events: events)
+// Reminders due on the shown day(s). Only fetched with --reminders, so the
+// Reminders permission prompt appears solely when the user opts in.
+var reminders: [CalReminder]? = nil
+var remindersError: String? = nil
+if wantReminders {
+  guard requestReminderAccess(store) else {
+    remindersError = "Reminders access denied. Allow in System Settings → Privacy & Security → Reminders, then re-run."
+    reminders = []
+    let payload = Payload(events: events, reminders: reminders, remindersError: remindersError)
+    let enc = JSONEncoder()
+    enc.outputFormatting = [.sortedKeys]
+    print(String(data: try! enc.encode(payload), encoding: .utf8)!)
+    exit(0)
+  }
+  let predicate = store.predicateForIncompleteReminders(withDueDateStarting: start, ending: end, calendars: nil)
+  let sem = DispatchSemaphore(value: 0)
+  var fetched: [EKReminder]? = nil
+  // fetchReminders exists on all supported macOS versions; the async variant
+  // is macOS 15+ only, so stay on the completion-handler form.
+  store.fetchReminders(matching: predicate) { found in
+    fetched = found
+    sem.signal()
+  }
+  sem.wait()
+  var out: [CalReminder] = []
+  out.reserveCapacity(fetched?.count ?? 0)
+  for rem in fetched ?? [] {
+    var dueISO: String? = nil
+    var timed = false
+    if let comps = rem.dueDateComponents,
+       let due = Calendar.current.date(from: comps) {
+      dueISO = isoOut.string(from: due)
+      timed = comps.hour != nil
+    }
+    out.append(CalReminder(
+      id: rem.calendarItemIdentifier,
+      title: rem.title ?? "(no title)",
+      due: dueISO,
+      allDay: !timed,
+      list: rem.calendar?.title ?? "",
+      listId: rem.calendar?.calendarIdentifier ?? ""
+    ))
+  }
+  out.sort { ($0.due ?? "") < ($1.due ?? "") }
+  reminders = out
+}
+
+let payload = Payload(events: events, reminders: reminders, remindersError: remindersError)
 let enc = JSONEncoder()
 enc.outputFormatting = [.sortedKeys]
 print(String(data: try! enc.encode(payload), encoding: .utf8)!)
