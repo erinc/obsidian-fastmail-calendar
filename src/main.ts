@@ -1,118 +1,128 @@
-import { App, FileSystemAdapter, ItemView, Platform, Plugin, PluginSettingTab, WorkspaceLeaf, Notice, Setting, setIcon } from "obsidian";
-import { compactTime, dayStamp, formatRange, momentFormatToRegex, parseDateFromBasename, startOfDay, toLocalISO } from "./dates";
+import {
+  App,
+  ItemView,
+  Notice,
+  Plugin,
+  PluginSettingTab,
+  Setting,
+  WorkspaceLeaf,
+  requestUrl,
+  setIcon,
+} from "obsidian";
+import { dayStamp, formatRange, momentFormatToRegex, parseDateFromBasename, startOfDay } from "./dates";
+import {
+  CalendarEvent,
+  FastmailCalDavClient,
+  FastmailCalendar,
+  partitionEventsByDay,
+} from "./fastmail";
 
-// Node APIs are only available on desktop. Import lazily so mobile never parses them.
-declare const require: (id: string) => any;
-
-export const VIEW_TYPE = "apple-calendar-view";
-
-interface CalEvent {
-  id: string;
-  title: string;
-  start: string; // ISO8601
-  end: string; // ISO8601
-  allDay: boolean;
-  calendar: string;
-  calendarId: string;
-  location?: string;
-  url?: string;
-}
-
-interface HelperCalendar {
-  id: string;
-  title: string;
-}
-
-interface CalReminder {
-  id: string;
-  title: string;
-  due?: string | null;
-  allDay: boolean;
-  list: string;
-  listId: string;
-}
+export const VIEW_TYPE = "fastmail-calendar-view";
 
 interface DayData {
-  events: CalEvent[];
-  reminders: CalReminder[];
-  remindersError?: string;
+  events: CalendarEvent[];
 }
 
-interface HelperResult {
-  events: CalEvent[];
-  reminders?: CalReminder[];
-  remindersError?: string;
-}
-
-interface AppleCalSettings {
+interface FastmailCalendarSettings {
+  username: string;
+  appPassword: string;
+  serverUrl: string;
   refreshMinutes: number;
   hideSoloTabHeader: boolean;
   hiddenCalendars: string[];
-  showReminders: boolean;
 }
 
-const DEFAULT_SETTINGS: AppleCalSettings = {
+const DEFAULT_SETTINGS: FastmailCalendarSettings = {
+  username: "",
+  appPassword: "",
+  serverUrl: "https://caldav.fastmail.com/",
   refreshMinutes: 15,
   hideSoloTabHeader: true,
   hiddenCalendars: [],
-  showReminders: true,
 };
 
-export default class AppleCalendarPlugin extends Plugin {
-  settings: AppleCalSettings = { ...DEFAULT_SETTINGS };
+const CACHE_TTL_MS = 5 * 60 * 1000;
+const WINDOW_RADIUS_DAYS = 7;
+const MAX_CACHED_DAYS = 45;
+
+export default class FastmailCalendarPlugin extends Plugin {
+  settings: FastmailCalendarSettings = { ...DEFAULT_SETTINGS };
+  currentDay: Date = startOfDay(new Date());
   private refreshTimer: number | null = null;
+  private eventCache = new Map<string, { at: number; data: DayData }>();
+  private calendarCache: { at: number; calendars: FastmailCalendar[] } | null = null;
+  private windowFetches = new Map<
+    string,
+    { from: number; to: number; generation: number; promise: Promise<Map<string, CalendarEvent[]>> }
+  >();
+  private cacheGeneration = 0;
 
   async onload() {
     await this.loadSettings();
-
-    this.registerView(VIEW_TYPE, (leaf) => new AppleCalendarView(leaf, this));
-
-    this.addRibbonIcon("calendar", "Open Apple Calendar", () => this.activateView());
+    this.registerView(VIEW_TYPE, (leaf) => new FastmailCalendarView(leaf, this));
+    this.addRibbonIcon("calendar", "Open Fastmail Calendar", () => this.activateView());
     this.addCommand({
-      id: "open-apple-calendar",
-      name: "Open Apple Calendar",
+      id: "open-fastmail-calendar",
+      name: "Open Fastmail Calendar",
       callback: () => this.activateView(),
     });
     this.addCommand({
-      id: "refresh-apple-calendar",
-      name: "Refresh Apple Calendar",
+      id: "refresh-fastmail-calendar",
+      name: "Refresh Fastmail Calendar",
       callback: () => this.refreshAllViews(false, true),
     });
-
-    this.addSettingTab(new AppleCalSettingTab(this.app, this));
-
-    this.registerEvent(
-      this.app.workspace.on("file-open", () => void this.onActiveFileChanged())
-    );
-
+    this.addSettingTab(new FastmailCalendarSettingTab(this.app, this));
+    this.registerEvent(this.app.workspace.on("file-open", () => void this.onActiveFileChanged()));
     this.app.workspace.onLayoutReady(async () => {
       const pattern = await this.resolveDatePattern();
       if (pattern) this.updateDayFromActiveFile(pattern);
-      this.activateView(true);
+      await this.activateView(true);
       this.refreshAllViews(true);
     });
-
     this.scheduleRefresh();
   }
 
   onunload() {
-    if (this.refreshTimer) window.clearInterval(this.refreshTimer);
+    if (this.refreshTimer !== null) window.clearInterval(this.refreshTimer);
   }
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
   }
 
-  async saveSettings() {
+  async saveSettings(clearCaches = false) {
     await this.saveData(this.settings);
+    if (clearCaches) this.clearCaches();
     this.scheduleRefresh();
   }
 
+  clearCaches() {
+    this.cacheGeneration += 1;
+    this.eventCache.clear();
+    this.calendarCache = null;
+    this.windowFetches.clear();
+  }
+
+  isConfigured(): boolean {
+    return Boolean(this.settings.username.trim() && this.settings.appPassword);
+  }
+
+  private client(): FastmailCalDavClient {
+    if (!this.isConfigured()) {
+      throw new Error("Add your Fastmail username and app password in the plugin settings.");
+    }
+    return new FastmailCalDavClient(this.settings, async (options) => {
+      const response = await requestUrl({ ...options, throw: false });
+      return { status: response.status, text: response.text };
+    });
+  }
+
   scheduleRefresh() {
-    if (this.refreshTimer) window.clearInterval(this.refreshTimer);
+    if (this.refreshTimer !== null) window.clearInterval(this.refreshTimer);
+    this.refreshTimer = null;
     if (this.settings.refreshMinutes > 0) {
       this.refreshTimer = window.setInterval(
-        () => this.refreshAllViews(true),
+        () => this.refreshAllViews(true, true),
         this.settings.refreshMinutes * 60 * 1000
       );
     }
@@ -120,71 +130,29 @@ export default class AppleCalendarPlugin extends Plugin {
 
   async activateView(passive = false) {
     const { workspace } = this.app;
-    let leaf: WorkspaceLeaf | null = null;
-    const leaves = workspace.getLeavesOfType(VIEW_TYPE);
-    if (leaves.length > 0) {
-      leaf = leaves[0];
-    } else {
+    let leaf: WorkspaceLeaf | null = workspace.getLeavesOfType(VIEW_TYPE)[0] ?? null;
+    if (!leaf) {
       leaf = workspace.getRightLeaf(false);
       if (!leaf) return;
       await leaf.setViewState({ type: VIEW_TYPE, active: true });
     }
-    if (!passive && leaf) workspace.revealLeaf(leaf);
+    if (!passive) workspace.revealLeaf(leaf);
   }
 
   refreshAllViews(quiet = false, force = false) {
     for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
       const view = leaf.view;
-      if (view instanceof AppleCalendarView) void view.refresh(quiet, force);
+      if (view instanceof FastmailCalendarView) void view.refresh(quiet, force);
     }
   }
 
-  /** Resolve the helper binary: plugin bin/ -> PATH. */
-  resolveHelperPath(): string {
-    try {
-      // manifest.dir is vault-relative (".obsidian/plugins/obsidian-apple-calendar");
-      // resolve it against the vault root to an absolute path.
-      const dir = (this as any).manifest?.dir as string | undefined;
-      const adapter = this.app.vault.adapter;
-      if (dir && adapter instanceof FileSystemAdapter) {
-        return adapter.getFullPath(`${dir}/bin/apple-calendar-helper`);
-      }
-    } catch {
-      // fall through to PATH
-    }
-    return "apple-calendar-helper";
-  }
-
-  /** Day shown in the sidebar (local start-of-day). */
-  currentDay: Date = startOfDay(new Date());
-  private eventCache = new Map<string, { at: number; data: DayData }>();
-
-  /**
-   * Recompute the shown day from the active note. Undated notes keep the
-   * current day so browsing non-journal notes doesn't yank the calendar.
-   * Returns true when the day changed.
-   */
-  /**
-   * What the running Obsidian exposes about Daily Notes. Never throws.
-   * enabled is null when the internal API can't say (very old builds).
-   */
   dailyNotesRuntime(): { enabled: boolean | null; format: string | null } {
     try {
       const internals = (this.app as any).internalPlugins;
       if (!internals) return { enabled: null, format: null };
-      // getEnabledPluginById returns the instance, or null when disabled.
       const inst = internals.getEnabledPluginById?.("daily-notes");
-      const raw =
-        internals.getPluginById?.("daily-notes") ?? internals.plugins?.["daily-notes"];
-      const enabled = inst
-        ? true
-        : raw
-          ? raw.enabled === false
-            ? false
-            : null
-          : false;
-      // raw is either the instance ({ options }) or a wrapper
-      // ({ enabled, instance }) — accept both so version drift can't lock out.
+      const raw = internals.getPluginById?.("daily-notes") ?? internals.plugins?.["daily-notes"];
+      const enabled = inst ? true : raw ? (raw.enabled === false ? false : null) : false;
       const format =
         inst?.options?.format ??
         raw?.options?.format ??
@@ -199,53 +167,38 @@ export default class AppleCalendarPlugin extends Plugin {
     }
   }
 
-  /**
-   * Daily Notes date format (moment-style), or null when unavailable.
-   * Current Obsidian only exposes folder/template on the live instance, so
-   * the persisted `.obsidian/daily-notes.json` is the primary source.
-   */
   async getDailyNotesFormat(): Promise<string | null> {
     const runtime = this.dailyNotesRuntime();
     if (runtime.format) return runtime.format;
     let filePresent = false;
     let fileFormat: string | null = null;
     try {
-      const raw = await this.app.vault.adapter.read(
-        `${this.app.vault.configDir}/daily-notes.json`
-      );
+      const raw = await this.app.vault.adapter.read(`${this.app.vault.configDir}/daily-notes.json`);
       filePresent = true;
       const parsed = JSON.parse(raw);
       if (typeof parsed?.format === "string" && parsed.format) fileFormat = parsed.format;
     } catch {
-      // No settings file — fall through to the default below.
+      // No settings file; use the core plugin state below.
     }
-    // An explicit format wins unless Daily Notes is explicitly disabled.
     if (fileFormat) return runtime.enabled === false ? null : fileFormat;
-    // Enabled with an empty format field behaves as Obsidian's default.
-    if (runtime.enabled === true || (runtime.enabled === null && filePresent)) {
-      return "YYYY-MM-DD";
-    }
+    if (runtime.enabled === true || (runtime.enabled === null && filePresent)) return "YYYY-MM-DD";
     return null;
   }
 
-  /** One-line diagnostic for the dev console when Daily Notes detection fails. */
   async describeDailyNotesAccess(): Promise<string> {
     const runtime = this.dailyNotesRuntime();
     let file = "unread";
     try {
-      const raw = await this.app.vault.adapter.read(
-        `${this.app.vault.configDir}/daily-notes.json`
-      );
+      const raw = await this.app.vault.adapter.read(`${this.app.vault.configDir}/daily-notes.json`);
       const parsed = JSON.parse(raw);
-      const show = (v: unknown) => (typeof v === "string" ? JSON.stringify(v) : typeof v);
+      const show = (value: unknown) => (typeof value === "string" ? JSON.stringify(value) : typeof value);
       file = `keys=[${Object.keys(parsed ?? {}).join(",")}] format=${show(parsed?.format)}`;
-    } catch (e) {
-      file = `read failed (${String(e)?.slice(0, 80)})`;
+    } catch (error) {
+      file = `read failed (${String(error).slice(0, 80)})`;
     }
     return `daily-notes detect: enabled=${String(runtime.enabled)} runtime.format=${JSON.stringify(runtime.format)} file ${file}`;
   }
 
-  /** Why date resolution failed, for the sidebar error. Null when resolvable. */
   async dateResolutionError(): Promise<string | null> {
     const format = await this.getDailyNotesFormat();
     if (!format) {
@@ -257,26 +210,18 @@ export default class AppleCalendarPlugin extends Plugin {
     return null;
   }
 
-  /**
-   * Matcher derived from Daily Notes only. Null when Daily Notes is
-   * disabled or its format is unmatchable (month/weekday names, times).
-   */
   async resolveDatePattern(): Promise<string | null> {
     const format = await this.getDailyNotesFormat();
-    if (!format) return null;
-    return momentFormatToRegex(format);
+    return format ? momentFormatToRegex(format) : null;
   }
 
   updateDayFromActiveFile(pattern: string): boolean {
     let day = startOfDay(new Date());
-    const f = this.app.workspace.getActiveFile();
-    if (f) {
-      const parsed = parseDateFromBasename(f.basename, pattern);
-      if (parsed) {
-        day = parsed;
-      } else {
-        return false;
-      }
+    const file = this.app.workspace.getActiveFile();
+    if (file) {
+      const parsed = parseDateFromBasename(file.basename, pattern);
+      if (!parsed) return false;
+      day = parsed;
     }
     if (+day === +this.currentDay) return false;
     this.currentDay = day;
@@ -292,166 +237,103 @@ export default class AppleCalendarPlugin extends Plugin {
     if (this.updateDayFromActiveFile(pattern)) this.refreshAllViews(true);
   }
 
-  /** Events + reminders for the current day (5-minute in-memory cache per day). */
-  fetchDay(force = false): Promise<DayData> {
-    const key = `${dayStamp(this.currentDay)}|rem:${this.settings.showReminders ? 1 : 0}`;
-    const cached = this.eventCache.get(key);
-    if (!force && cached && Date.now() - cached.at < 5 * 60 * 1000) {
-      return Promise.resolve({
-        events: this.applyCalendarFilter(cached.data.events),
-        reminders: cached.data.reminders,
-        remindersError: cached.data.remindersError,
-      });
+  async listCalendars(force = false): Promise<FastmailCalendar[]> {
+    if (!force && this.calendarCache && Date.now() - this.calendarCache.at < 10 * 60 * 1000) {
+      return this.calendarCache.calendars;
     }
-    return this.runHelperForDay(this.currentDay).then((data) => {
-      this.eventCache.set(key, { at: Date.now(), data });
-      if (this.eventCache.size > 14) {
-        const oldest = [...this.eventCache.keys()].sort()[0];
+    const generation = this.cacheGeneration;
+    const calendars = await this.client().listCalendars();
+    if (generation === this.cacheGeneration) {
+      this.calendarCache = { at: Date.now(), calendars };
+    }
+    return calendars;
+  }
+
+  async fetchDay(day: Date, force = false): Promise<DayData> {
+    const requestedDay = new Date(day.getFullYear(), day.getMonth(), day.getDate());
+    const key = dayStamp(requestedDay);
+    const cached = this.eventCache.get(key);
+    if (!force && cached && Date.now() - cached.at < CACHE_TTL_MS) {
+      return cached.data;
+    }
+
+    const from = new Date(
+      requestedDay.getFullYear(),
+      requestedDay.getMonth(),
+      requestedDay.getDate() - WINDOW_RADIUS_DAYS
+    );
+    const to = new Date(
+      requestedDay.getFullYear(),
+      requestedDay.getMonth(),
+      requestedDay.getDate() + WINDOW_RADIUS_DAYS + 1
+    );
+    const generation = this.cacheGeneration;
+    const windowKey = `${generation}:${dayStamp(from)}:${dayStamp(to)}`;
+    let pending = [...this.windowFetches.values()].find(
+      (request) =>
+        request.generation === generation &&
+        requestedDay.getTime() >= request.from &&
+        requestedDay.getTime() < request.to
+    )?.promise;
+    if (!pending) {
+      pending = this.fetchWindow(from, to, force, generation);
+      this.windowFetches.set(windowKey, {
+        from: from.getTime(),
+        to: to.getTime(),
+        generation,
+        promise: pending,
+      });
+      const clearPending = () => {
+        if (this.windowFetches.get(windowKey)?.promise === pending) this.windowFetches.delete(windowKey);
+      };
+      void pending.then(clearPending, clearPending);
+    }
+    const days = await pending;
+    return { events: days.get(key) ?? [] };
+  }
+
+  private async fetchWindow(
+    from: Date,
+    to: Date,
+    forceCalendars: boolean,
+    generation: number
+  ): Promise<Map<string, CalendarEvent[]>> {
+    const calendars = await this.listCalendars(forceCalendars);
+    const hidden = new Set(this.settings.hiddenCalendars);
+    const visible = calendars.filter((calendar) => !hidden.has(calendar.id));
+    const batches = await Promise.all(
+      visible.map((calendar) => this.client().fetchEvents(calendar, from, to))
+    );
+    const days = partitionEventsByDay(batches.flat(), from, to);
+    if (generation === this.cacheGeneration) {
+      const fetchedAt = Date.now();
+      for (const [key, events] of days) {
+        this.eventCache.set(key, { at: fetchedAt, data: { events } });
+      }
+      while (this.eventCache.size > MAX_CACHED_DAYS) {
+        const oldest = [...this.eventCache.entries()].sort((a, b) => a[1].at - b[1].at)[0]?.[0];
+        if (!oldest) break;
         this.eventCache.delete(oldest);
       }
-      return { ...data, events: this.applyCalendarFilter(data.events) };
-    });
+    }
+    return days;
   }
 
-  /** Drop events from hidden calendars (applied after the cache, so toggles take effect immediately). */
-  private applyCalendarFilter(events: CalEvent[]): CalEvent[] {
-    if (this.settings.hiddenCalendars.length === 0) return events;
-    const hidden = new Set(this.settings.hiddenCalendars);
-    return events.filter((ev) => !hidden.has(ev.calendarId || ev.calendar));
-  }
-
-  /** Spawn the helper, resolving with stdout. Rejects with a human message. */
-  private spawnHelper(args: string[]): Promise<string> {
-    return new Promise((resolve, reject) => {
-      if (!Platform.isDesktop || !Platform.isMacOS) {
-        reject(new Error("Apple Calendar view is macOS desktop only."));
-        return;
-      }
-      let spawn: any;
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        spawn = require("child_process").spawn;
-      } catch {
-        reject(new Error("Node child_process is unavailable in this Obsidian build."));
-        return;
-      }
-      const helper = this.resolveHelperPath();
-      const child = spawn(helper, args, { timeout: 15000 });
-
-      let stdout = "";
-      let stderr = "";
-      child.stdout?.on("data", (d: Buffer) => (stdout += d.toString()));
-      child.stderr?.on("data", (d: Buffer) => (stderr += d.toString()));
-      child.on("error", (err: Error) => {
-        if ((err as any)?.code === "ENOENT") {
-          reject(
-            new Error(
-              `Helper not found at "${helper}". Build it (npm run helper:build) and copy it into the plugin's bin/ folder.`
-            )
-          );
-        } else {
-          reject(err);
-        }
-      });
-      child.on("close", (code: number) => {
-        if (code !== 0) {
-          const hint = stderr.trim() || stdout.trim() || `exit code ${code}`;
-          if (/denied|not authorized|TCC|privacy/i.test(hint)) {
-            reject(
-              new Error(
-                "Calendar access denied. Open System Settings → Privacy & Security → Calendars and allow Obsidian (first run prompts from the helper). " +
-                  `Detail: ${hint}`
-              )
-            );
-          } else {
-            reject(new Error(`Calendar helper failed: ${hint}`));
-          }
-          return;
-        }
-        resolve(stdout);
-      });
-    });
-  }
-
-  /** Run the Swift helper for one local day and parse its JSON. Throws with a human message. */
-  private runHelperForDay(day: Date): Promise<DayData> {
-    const from = new Date(day);
-    const to = new Date(day.getTime() + 24 * 60 * 60 * 1000);
-    const args = ["--from", toLocalISO(from), "--to", toLocalISO(to), "--json"];
-    if (this.settings.showReminders) args.push("--reminders");
-    return this.spawnHelper(args).then((stdout) => {
-      try {
-        const parsed = JSON.parse(stdout) as HelperResult | CalEvent[];
-        if (Array.isArray(parsed)) return { events: parsed, reminders: [] };
-        const reminders = this.settings.showReminders ? parsed.reminders ?? [] : [];
-        return { events: parsed.events ?? [], reminders, remindersError: parsed.remindersError };
-      } catch {
-        throw new Error(`Calendar helper returned invalid JSON: ${stdout.slice(0, 200)}`);
-      }
-    });
-  }
-
-  /** List available calendars via the helper. Throws with a human message. */
-  listCalendars(): Promise<HelperCalendar[]> {
-    return this.spawnHelper(["calendars"]).then((stdout) => {
-      try {
-        const parsed = JSON.parse(stdout) as { calendars: HelperCalendar[] };
-        return parsed.calendars ?? [];
-      } catch {
-        throw new Error(`Calendar helper returned invalid JSON: ${stdout.slice(0, 200)}`);
-      }
-    });
-  }
-
-  /**
-   * Open the event in Calendar.app via its ical:// deep link.
-   * Deliberately not AppleScript: an unbounded `whose uid` lookup scans
-   * entire calendars and hangs on large stores. Failures surface as a Notice.
-   */
-  openInCalendar(ev: CalEvent): Promise<void> {
-    return new Promise((resolve) => {
-      let spawn: any;
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        spawn = require("child_process").spawn;
-      } catch {
-        new Notice("Node child_process is unavailable in this Obsidian build.");
-        resolve();
-        return;
-      }
-      const url = `ical://ekevent/${encodeURIComponent(ev.id)}?method=show&options=more`;
-      const child = spawn("/usr/bin/open", [url], { timeout: 15000 });
-      let stderr = "";
-      child.stderr?.on("data", (d: Buffer) => (stderr += d.toString()));
-      child.on("error", (err: Error) => {
-        new Notice(`Could not open event in Calendar: ${(err as Error)?.message ?? err}`);
-        resolve();
-      });
-      child.on("close", (code: number | null, signal: string | null) => {
-        if (code !== 0) {
-          const detail =
-            stderr.trim() ||
-            (signal ? `killed by ${signal} (Calendar may have hung)` : `exit code ${code}`);
-          new Notice(`Could not open event in Calendar: ${detail}`);
-        }
-        resolve();
-      });
-    });
+  openInFastmail() {
+    window.open("https://app.fastmail.com/calendar/", "_blank", "noopener");
   }
 }
 
-class AppleCalendarView extends ItemView {
-  private plugin: AppleCalendarPlugin;
-  private events: CalEvent[] = [];
-  private reminders: CalReminder[] = [];
-  private remindersError = "";
+class FastmailCalendarView extends ItemView {
+  private events: CalendarEvent[] = [];
   private error = "";
   private errorHint = "";
   private loading = false;
+  private shownDay = "";
+  private refreshGeneration = 0;
 
-  constructor(leaf: WorkspaceLeaf, plugin: AppleCalendarPlugin) {
+  constructor(leaf: WorkspaceLeaf, private plugin: FastmailCalendarPlugin) {
     super(leaf);
-    this.plugin = plugin;
   }
 
   getViewType() {
@@ -459,7 +341,7 @@ class AppleCalendarView extends ItemView {
   }
 
   getDisplayText() {
-    return "Apple Calendar";
+    return "Fastmail Calendar";
   }
 
   getIcon() {
@@ -472,11 +354,6 @@ class AppleCalendarView extends ItemView {
     await this.refresh(true);
   }
 
-  /**
-   * Hide our tab header when we're the only tab in the group (e.g. stacked
-   * under the calendar pane), so no redundant tab strip separates the views.
-   * Restored automatically when grouped with other tabs.
-   */
   updateTabChrome() {
     try {
       const leaf = this.leaf as any;
@@ -487,214 +364,214 @@ class AppleCalendarView extends ItemView {
         target.style.display = "";
         return;
       }
-      const siblings = (leaf?.parent?.children?.length ?? 1) as number;
-      target.style.display = siblings <= 1 ? "none" : "";
+      target.style.display = (leaf?.parent?.children?.length ?? 1) <= 1 ? "none" : "";
     } catch {
-      // Non-standard layout — leave the chrome alone.
+      // Leave non-standard layouts untouched.
     }
   }
 
   async refresh(quiet = false, force = false) {
-    if (this.loading) return;
+    const generation = ++this.refreshGeneration;
+    const requestedDay = new Date(
+      this.plugin.currentDay.getFullYear(),
+      this.plugin.currentDay.getMonth(),
+      this.plugin.currentDay.getDate()
+    );
+    const requestedStamp = dayStamp(requestedDay);
+    const dayChanged = requestedStamp !== this.shownDay;
+    this.shownDay = requestedStamp;
     this.loading = true;
-    if (!quiet) this.render();
+    if (dayChanged) {
+      this.events = [];
+      this.error = "";
+      this.errorHint = "";
+    }
+    if (dayChanged || !quiet) this.render();
     const pattern = await this.plugin.resolveDatePattern();
+    if (generation !== this.refreshGeneration) return;
     if (!pattern) {
-      console.debug(`[apple-calendar] ${await this.plugin.describeDailyNotesAccess()}`);
+      const diagnostic = await this.plugin.describeDailyNotesAccess();
+      if (generation !== this.refreshGeneration) return;
+      console.debug(`[fastmail-calendar] ${diagnostic}`);
       this.error =
         (await this.plugin.dateResolutionError()) ??
-        "Daily Notes is required — enable the Daily Notes core plugin with a numeric date format (e.g. YYYY-MM-DD).";
+        "Daily Notes is required — enable it with a numeric date format.";
+      if (generation !== this.refreshGeneration) return;
       this.errorHint = "";
+      this.events = [];
       this.loading = false;
       this.render();
       return;
     }
     try {
-      const day = await this.plugin.fetchDay(force);
+      const day = await this.plugin.fetchDay(requestedDay, force);
+      if (generation !== this.refreshGeneration) return;
       this.events = day.events;
-      this.reminders = day.reminders;
-      this.remindersError = day.remindersError ?? "";
       this.error = "";
       this.errorHint = "";
-    } catch (e: any) {
-      this.error = e?.message ?? String(e);
-      this.errorHint = "Read-only. Grant Calendars access in System Settings, then retry.";
+    } catch (error: any) {
+      if (generation !== this.refreshGeneration) return;
+      this.error = error?.message ?? String(error);
+      this.events = [];
+      this.errorHint = this.plugin.isConfigured()
+        ? "Check the connection in Fastmail Calendar settings, then retry."
+        : "Open Fastmail Calendar settings to connect your account.";
       if (!quiet) new Notice(this.error);
     } finally {
-      this.loading = false;
-      this.render();
+      if (generation === this.refreshGeneration) {
+        this.loading = false;
+        this.render();
+      }
     }
   }
 
   private render() {
-    const el = this.contentEl;
-    el.empty();
-    el.addClass("obsidian-apple-calendar");
-
-    const showReminders = this.plugin.settings.showReminders;
-    const hasContent = this.events.length > 0 || (showReminders && this.reminders.length > 0);
-    if (this.loading && !hasContent) {
-      el.createEl("p", { text: "Loading…", cls: "obsidian-apple-cal-muted" });
+    const element = this.contentEl;
+    element.empty();
+    element.addClass("obsidian-fastmail-calendar");
+    if (this.loading && this.events.length === 0) {
+      element.createEl("p", { text: "Loading…", cls: "obsidian-fastmail-cal-muted" });
       return;
     }
-    if (this.error && !hasContent) {
-      el.createEl("p", { text: this.error, cls: "obsidian-apple-cal-error" });
-      if (this.errorHint) {
-        el.createEl("p", { text: this.errorHint, cls: "obsidian-apple-cal-muted" });
-      }
-      const retry = el.createEl("button", { text: "Retry", cls: "obsidian-apple-cal-retry" });
+    if (this.error && this.events.length === 0) {
+      element.createEl("p", { text: this.error, cls: "obsidian-fastmail-cal-error" });
+      if (this.errorHint) element.createEl("p", { text: this.errorHint, cls: "obsidian-fastmail-cal-muted" });
+      const retry = element.createEl("button", { text: "Retry", cls: "obsidian-fastmail-cal-retry" });
       retry.onclick = () => void this.refresh(false, true);
       return;
     }
-    // Empty days render nothing — no placeholder text.
-    if (!hasContent && !this.remindersError) {
-      return;
-    }
+    if (this.events.length === 0) return;
 
-    // One combined list: events and reminders interleaved chronologically.
-    // Timeless rows (all-day events, undated reminders) sort first.
-    type Row =
-      | { kind: "event"; at: number; ev: CalEvent }
-      | { kind: "reminder"; at: number; rem: CalReminder };
-    const rows: Row[] = [];
-    if (this.events.length > 0) {
-      const sorted = [...this.events].sort((a, b) => +new Date(a.start) - +new Date(b.start));
-      for (const ev of sorted) {
-        const at = +new Date(ev.start);
-        rows.push({ kind: "event", at: Number.isFinite(at) ? at : Number.POSITIVE_INFINITY, ev });
+    const list = element.createEl("ul", { cls: "obsidian-fastmail-cal-list" });
+    for (const event of this.events) {
+      const item = list.createEl("li", { cls: "obsidian-fastmail-cal-item" });
+      const row = item.createEl("div", { cls: "obsidian-fastmail-cal-row" });
+      const icon = row.createEl("span", { cls: "obsidian-fastmail-cal-icon" });
+      setIcon(icon, "calendar");
+      const title = event.title || "(no title)";
+      const titleElement = row.createEl("div", {
+        text: title,
+        cls: "obsidian-fastmail-cal-title obsidian-fastmail-cal-open",
+      });
+      titleElement.setAttribute("title", `${title} — open Fastmail Calendar`);
+      titleElement.onclick = () => this.plugin.openInFastmail();
+      const range = formatRange(event.start, event.end, event.allDay);
+      const metaText = [range, event.calendar].filter(Boolean).join(" · ");
+      if (metaText) {
+        const metaElement = item.createEl("div", {
+          text: metaText,
+          cls: "obsidian-fastmail-cal-meta obsidian-fastmail-cal-meta-indent",
+        });
+        metaElement.setAttribute("title", metaText);
       }
-    }
-    if (showReminders) {
-      for (const rem of this.reminders) {
-        let at = Number.NEGATIVE_INFINITY;
-        if (rem.due) {
-          const t = +new Date(rem.due);
-          if (Number.isFinite(t)) at = t;
-        }
-        rows.push({ kind: "reminder", at, rem });
-      }
-    }
-    rows.sort((a, b) => a.at - b.at || (a.kind === b.kind ? 0 : a.kind === "event" ? -1 : 1));
-
-    const ul = el.createEl("ul", { cls: "obsidian-apple-cal-list" });
-    for (const row of rows) {
-      const li = ul.createEl("li", { cls: "obsidian-apple-cal-item" });
-      const line = li.createEl("div", { cls: "obsidian-apple-cal-row" });
-      if (row.kind === "event") {
-        const ev = row.ev;
-        const icon = line.createEl("span", { cls: "obsidian-apple-cal-icon" });
-        setIcon(icon, "calendar");
-        const title = ev.title || "(no title)";
-        const titleEl = line.createEl("div", { text: title, cls: "obsidian-apple-cal-title obsidian-apple-cal-open" });
-        titleEl.setAttribute("title", `${title} — open in Calendar`);
-        titleEl.onclick = () => void this.plugin.openInCalendar(ev);
-        const range = formatRange(ev.start, ev.end, ev.allDay);
-        const meta = range ? [range] : [];
-        if (ev.calendar) meta.push(ev.calendar);
-        if (meta.length > 0) {
-          const metaEl = li.createEl("div", { text: meta.join(" · "), cls: "obsidian-apple-cal-meta obsidian-apple-cal-meta-indent" });
-          metaEl.setAttribute("title", meta.join(" · "));
-        }
-      } else {
-        // Reminder titles stay plain text (no deep link into
-        // Reminders.app — it has no stable URL scheme like Calendar).
-        const rem = row.rem;
-        const icon = line.createEl("span", { cls: "obsidian-apple-cal-icon" });
-        setIcon(icon, "check-square");
-        line.createEl("div", { text: rem.title || "(no title)", cls: "obsidian-apple-cal-title" });
-        const meta: string[] = [];
-        if (rem.due && !rem.allDay) {
-          try {
-            meta.push(compactTime(new Date(rem.due)));
-          } catch {
-            // Ignore unparseable due dates — list name still shows.
-          }
-        }
-        if (rem.list) meta.push(rem.list);
-        if (meta.length > 0) {
-          const metaEl = li.createEl("div", { text: meta.join(" · "), cls: "obsidian-apple-cal-meta obsidian-apple-cal-meta-indent" });
-          metaEl.setAttribute("title", meta.join(" · "));
-        }
-      }
-    }
-
-    if (showReminders && this.remindersError) {
-      el.createEl("div", { text: this.remindersError, cls: "obsidian-apple-cal-muted" });
     }
   }
 }
 
-
-
-class AppleCalSettingTab extends PluginSettingTab {
-  constructor(app: App, private plugin: AppleCalendarPlugin) {
+class FastmailCalendarSettingTab extends PluginSettingTab {
+  constructor(app: App, private plugin: FastmailCalendarPlugin) {
     super(app, plugin);
   }
+
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
+    containerEl.createEl("h2", { text: "Fastmail Calendar" });
+    containerEl.createEl("p", {
+      text: "Use your full Fastmail email address and a calendar-enabled app password. The password is stored in Obsidian's local plugin data.",
+      cls: "setting-item-description",
+    });
     new Setting(containerEl)
-      .setName("Auto-refresh (minutes)")
-      .setDesc("0 disables auto-refresh.")
-      .addText((t) =>
-        t.setValue(String(this.plugin.settings.refreshMinutes)).onChange(async (v) => {
-          this.plugin.settings.refreshMinutes = Number(v) || 0;
-          await this.plugin.saveSettings();
+      .setName("Fastmail username")
+      .setDesc("Your full Fastmail email address, including the domain.")
+      .addText((text) =>
+        text.setPlaceholder("you@example.com").setValue(this.plugin.settings.username).onChange(async (value) => {
+          this.plugin.settings.username = value.trim();
+          await this.plugin.saveSettings(true);
         })
       );
     new Setting(containerEl)
-      .setName("Show reminders")
-      .setDesc("Show Apple Reminders due on the shown day. First use triggers a one-time Reminders permission prompt.")
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.showReminders).onChange(async (v) => {
-          this.plugin.settings.showReminders = v;
+      .setName("App password")
+      .setDesc("Create one in Fastmail → Settings → Privacy & Security → Manage app passwords.")
+      .addText((text) => {
+        text.inputEl.type = "password";
+        text.setPlaceholder("Fastmail app password").setValue(this.plugin.settings.appPassword).onChange(async (value) => {
+          this.plugin.settings.appPassword = value;
+          await this.plugin.saveSettings(true);
+        });
+      });
+    new Setting(containerEl)
+      .setName("Connection")
+      .setDesc("Tests the credentials and reloads the calendar list.")
+      .addButton((button) =>
+        button.setButtonText("Test connection").onClick(async () => {
+          button.setDisabled(true).setButtonText("Testing…");
+          try {
+            const calendars = await this.plugin.listCalendars(true);
+            new Notice(`Connected to Fastmail. Found ${calendars.length} calendar${calendars.length === 1 ? "" : "s"}.`);
+            this.display();
+            this.plugin.refreshAllViews(true, true);
+          } catch (error: any) {
+            new Notice(error?.message ?? String(error));
+            button.setDisabled(false).setButtonText("Test connection");
+          }
+        })
+      );
+    new Setting(containerEl)
+      .setName("Auto-refresh (minutes)")
+      .setDesc("0 disables auto-refresh.")
+      .addText((text) =>
+        text.setValue(String(this.plugin.settings.refreshMinutes)).onChange(async (value) => {
+          this.plugin.settings.refreshMinutes = Math.max(0, Number(value) || 0);
           await this.plugin.saveSettings();
-          this.plugin.refreshAllViews(true, true);
         })
       );
     new Setting(containerEl)
       .setName("Hide tab header when alone")
-      .setDesc("Hides this pane's tab strip when it is the only tab in its group (e.g. stacked under the calendar).")
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.hideSoloTabHeader).onChange(async (v) => {
-          this.plugin.settings.hideSoloTabHeader = v;
+      .setDesc("Hides this pane's tab strip when it is the only tab in its group.")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.hideSoloTabHeader).onChange(async (value) => {
+          this.plugin.settings.hideSoloTabHeader = value;
           await this.plugin.saveSettings();
           for (const leaf of this.plugin.app.workspace.getLeavesOfType(VIEW_TYPE)) {
             const view = leaf.view;
-            if (view instanceof AppleCalendarView) view.updateTabChrome();
+            if (view instanceof FastmailCalendarView) view.updateTabChrome();
           }
         })
       );
-    const calSection = new Setting(containerEl)
-      .setName("Calendars")
-      .setDesc("Loading calendar list…");
+
+    const calendarSection = new Setting(containerEl).setName("Calendars");
+    if (!this.plugin.isConfigured()) {
+      calendarSection.setDesc("Enter your Fastmail credentials above to load calendars.");
+      return;
+    }
+    calendarSection.setDesc("Loading calendar list…");
     void this.plugin.listCalendars().then(
-      (cals) => {
-        if (cals.length === 0) {
-          calSection.setDesc("No calendars found.");
+      (calendars) => {
+        if (calendars.length === 0) {
+          calendarSection.setDesc("No calendars found.");
           return;
         }
-        calSection.setDesc("Uncheck calendars to hide their events. New calendars show by default.");
+        calendarSection.setDesc("Uncheck calendars to hide their events. New calendars show by default.");
         const hidden = new Set(this.plugin.settings.hiddenCalendars);
-        for (const cal of cals) {
+        for (const calendar of calendars) {
           new Setting(containerEl)
-            .setClass("obsidian-apple-cal-compact")
-            .setName(cal.title)
-            .addToggle((t) =>
-              t.setValue(!hidden.has(cal.id)).onChange(async (v) => {
+            .setClass("obsidian-fastmail-cal-compact")
+            .setName(calendar.title)
+            .addToggle((toggle) =>
+              toggle.setValue(!hidden.has(calendar.id)).onChange(async (value) => {
                 const next = new Set(this.plugin.settings.hiddenCalendars);
-                if (v) next.delete(cal.id);
-                else next.add(cal.id);
+                if (value) next.delete(calendar.id);
+                else next.add(calendar.id);
                 this.plugin.settings.hiddenCalendars = [...next];
+                this.plugin.clearCaches();
                 await this.plugin.saveSettings();
-                this.plugin.refreshAllViews(true);
+                this.plugin.refreshAllViews(true, true);
               })
             );
         }
       },
-      (err: Error) => {
-        calSection.setDesc(`Could not load calendars: ${err.message}`);
-      }
+      (error: Error) => calendarSection.setDesc(`Could not load calendars: ${error.message}`)
     );
   }
 }

@@ -1,17 +1,23 @@
 {
-  "name": "obsidian-apple-calendar",
-  "version": "0.1.0",
-  "description": "Obsidian plugin: read-only Apple Calendar sidebar (macOS, EventKit helper)",
+  "name": "obsidian-fastmail-calendar",
+  "version": "0.2.0",
+  "description": "Obsidian plugin: read-only Fastmail Calendar sidebar via CalDAV",
   "type": "module",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "node esbuild.config.mjs production",
-    "helper:build": "mkdir -p bin && swiftc -module-cache-path /tmp/swift-mc -O -framework EventKit -framework Foundation -o bin/apple-calendar-helper swift/Sources/apple-calendar-helper/main.swift"
+    "test": "tsx --test tests/**/*.test.ts",
+    "check": "tsc --noEmit && npm test && npm run build"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
-    "esbuild": "^0.20.2",
+    "esbuild": "^0.28.2",
     "obsidian": "^1.4.0",
+    "tsx": "^4.23.15",
     "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^5.11.1",
+    "ical.js": "^2.2.1"
   }
 }

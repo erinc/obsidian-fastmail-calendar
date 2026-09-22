@@ -1,10 +1,10 @@
 {
-  "id": "obsidian-apple-calendar",
-  "name": "Apple Calendar",
-  "version": "0.1.0",
+  "id": "obsidian-fastmail-calendar",
+  "name": "Fastmail Calendar",
+  "version": "0.2.0",
   "minAppVersion": "1.4.0",
-  "description": "Read-only sidebar view of macOS Apple Calendar events via a tiny EventKit helper.",
-  "author": "you",
-  "authorUrl": "",
-  "isDesktopOnly": true
+  "description": "Read-only sidebar view of Fastmail Calendar events via CalDAV.",
+  "author": "erinc",
+  "authorUrl": "https://github.com/erinc",
+  "isDesktopOnly": false
 }
