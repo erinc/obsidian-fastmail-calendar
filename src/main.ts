@@ -9,7 +9,7 @@ import {
   requestUrl,
   setIcon,
 } from "obsidian";
-import { dayStamp, formatRange, momentFormatToRegex, parseDateFromBasename, startOfDay } from "./dates";
+import { dayStamp, formatRange, momentFormatToRegex, parseDateFromBasename } from "./dates";
 import {
   CalendarEvent,
   FastmailCalDavClient,
@@ -47,7 +47,7 @@ const MAX_CACHED_DAYS = 45;
 
 export default class FastmailCalendarPlugin extends Plugin {
   settings: FastmailCalendarSettings = { ...DEFAULT_SETTINGS };
-  currentDay: Date = startOfDay(new Date());
+  currentDay: Date | null = null;
   private refreshTimer: number | null = null;
   private eventCache = new Map<string, { at: number; data: DayData }>();
   private calendarCache: { at: number; calendars: FastmailCalendar[] } | null = null;
@@ -216,14 +216,10 @@ export default class FastmailCalendarPlugin extends Plugin {
   }
 
   updateDayFromActiveFile(pattern: string): boolean {
-    let day = startOfDay(new Date());
     const file = this.app.workspace.getActiveFile();
-    if (file) {
-      const parsed = parseDateFromBasename(file.basename, pattern);
-      if (!parsed) return false;
-      day = parsed;
-    }
-    if (+day === +this.currentDay) return false;
+    const day = file ? parseDateFromBasename(file.basename, pattern) : null;
+    if (day === null && this.currentDay === null) return false;
+    if (day !== null && this.currentDay !== null && +day === +this.currentDay) return false;
     this.currentDay = day;
     return true;
   }
@@ -372,15 +368,14 @@ class FastmailCalendarView extends ItemView {
 
   async refresh(quiet = false, force = false) {
     const generation = ++this.refreshGeneration;
-    const requestedDay = new Date(
-      this.plugin.currentDay.getFullYear(),
-      this.plugin.currentDay.getMonth(),
-      this.plugin.currentDay.getDate()
-    );
-    const requestedStamp = dayStamp(requestedDay);
+    const selectedDay = this.plugin.currentDay;
+    const requestedDay = selectedDay
+      ? new Date(selectedDay.getFullYear(), selectedDay.getMonth(), selectedDay.getDate())
+      : null;
+    const requestedStamp = requestedDay ? dayStamp(requestedDay) : "";
     const dayChanged = requestedStamp !== this.shownDay;
     this.shownDay = requestedStamp;
-    this.loading = true;
+    this.loading = requestedDay !== null;
     if (dayChanged) {
       this.events = [];
       this.error = "";
@@ -399,6 +394,14 @@ class FastmailCalendarView extends ItemView {
       if (generation !== this.refreshGeneration) return;
       this.errorHint = "";
       this.events = [];
+      this.loading = false;
+      this.render();
+      return;
+    }
+    if (!requestedDay) {
+      this.events = [];
+      this.error = "";
+      this.errorHint = "";
       this.loading = false;
       this.render();
       return;

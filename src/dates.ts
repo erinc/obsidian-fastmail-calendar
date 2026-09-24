@@ -97,7 +97,7 @@ export function momentFormatToRegex(format: string): string | null {
     i += 1;
   }
   if (!used.has("y") || !used.has("m") || !used.has("d")) return null;
-  return out;
+  return `^${out}$`;
 }
 
 export function prettyDay(d: Date): string {

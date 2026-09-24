@@ -99,8 +99,8 @@ the sidebar. It also opens automatically when the workspace is ready.
 
 When a Daily Note is opened, the plugin derives its date from the configured
 Daily Notes format and displays events that overlap that local day. Opening an
-undated note keeps the most recently selected date instead of jumping back to
-today.
+undated or non-journal note clears the sidebar and does not make a calendar
+request. The sidebar also stays empty when no note is open.
 
 Each event row contains:
 
